@@ -1,0 +1,178 @@
+name: PR Preview (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      port:
+        description: "Container port to expose"
+        type: string
+        default: "3000"
+      dockerfile:
+        description: "Path to Dockerfile"
+        type: string
+        default: "./Dockerfile"
+      server_host:
+        description: "Deploy server host"
+        type: string
+        default: "138.2.122.226"
+      server_user:
+        description: "Deploy server SSH user"
+        type: string
+        default: "ubuntu"
+      preview_domain:
+        description: "Base domain for preview URLs"
+        type: string
+        default: "preview.leejh.in"
+      runner:
+        description: "GitHub Actions runner label (JSON array)"
+        type: string
+        default: '["self-hosted", "linux", "arm64"]'
+
+jobs:
+  deploy:
+    if: github.event.action != 'closed'
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    permissions:
+      contents: read
+      packages: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set preview metadata
+        id: meta
+        run: |
+          REPO_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2 | tr '.' '-')
+          PR_NUM=${{ github.event.pull_request.number }}
+          CONTAINER="${REPO_NAME}-pr-${PR_NUM}"
+          HOST="${CONTAINER}.${{ inputs.preview_domain }}"
+          IMAGE="ghcr.io/${{ github.repository }}:pr-${PR_NUM}"
+
+          echo "repo_name=${REPO_NAME}" >> $GITHUB_OUTPUT
+          echo "container=${CONTAINER}" >> $GITHUB_OUTPUT
+          echo "host=${HOST}" >> $GITHUB_OUTPUT
+          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push preview image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+
+      - name: Deploy preview container
+        env:
+          CONTAINER: ${{ steps.meta.outputs.container }}
+          HOST: ${{ steps.meta.outputs.host }}
+          IMAGE: ${{ steps.meta.outputs.image }}
+          PORT: ${{ inputs.port }}
+          SERVER: ${{ inputs.server_user }}@${{ inputs.server_host }}
+          DOMAIN: ${{ inputs.preview_domain }}
+        run: |
+          ssh -o StrictHostKeyChecking=no ${SERVER} bash -s <<DEPLOY_EOF
+            # Login to GHCR
+            echo '${{ secrets.GITHUB_TOKEN }}' | sudo docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            # Pull latest image
+            sudo docker pull ${IMAGE}
+
+            # Remove existing preview container if any
+            sudo docker rm -f ${CONTAINER} 2>/dev/null || true
+
+            # Run with Traefik labels
+            sudo docker run -d \
+              --name ${CONTAINER} \
+              --network traefik-public \
+              --restart unless-stopped \
+              --label "traefik.enable=true" \
+              --label "traefik.http.routers.${CONTAINER}.rule=Host(\`${HOST}\`)" \
+              --label "traefik.http.routers.${CONTAINER}.entrypoints=websecure" \
+              --label "traefik.http.routers.${CONTAINER}.tls=true" \
+              --label "traefik.http.routers.${CONTAINER}.tls.certresolver=myresolver" \
+              --label "traefik.http.routers.${CONTAINER}.tls.domains[0].main=${DOMAIN}" \
+              --label "traefik.http.routers.${CONTAINER}.tls.domains[0].sans=*.${DOMAIN}" \
+              --label "traefik.http.services.${CONTAINER}.loadbalancer.server.port=${PORT}" \
+              --label "traefik.http.routers.${CONTAINER}-http.rule=Host(\`${HOST}\`)" \
+              --label "traefik.http.routers.${CONTAINER}-http.entrypoints=web" \
+              --label "traefik.http.routers.${CONTAINER}-http.middlewares=${CONTAINER}-redirect" \
+              --label "traefik.http.middlewares.${CONTAINER}-redirect.redirectscheme.scheme=https" \
+              --label "traefik.http.middlewares.${CONTAINER}-redirect.redirectscheme.permanent=true" \
+              ${IMAGE}
+          DEPLOY_EOF
+
+      - name: Comment preview URL
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const host = '${{ steps.meta.outputs.host }}';
+            const url = `https://${host}`;
+            const marker = '<!-- pr-preview-bot -->';
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+            });
+
+            const existing = comments.find(c => c.body.includes(marker));
+            const body = [
+              marker,
+              `| Preview | URL |`,
+              `|---------|-----|`,
+              `| ${context.repo.repo} PR #${context.payload.pull_request.number} | ${url} |`,
+              ``,
+              `> Last updated: ${new Date().toISOString()}`,
+            ].join('\n');
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body,
+              });
+            }
+
+  cleanup:
+    if: github.event.action == 'closed'
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    permissions:
+      packages: write
+
+    steps:
+      - name: Set preview metadata
+        id: meta
+        run: |
+          REPO_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2 | tr '.' '-')
+          PR_NUM=${{ github.event.pull_request.number }}
+          echo "container=${REPO_NAME}-pr-${PR_NUM}" >> $GITHUB_OUTPUT
+          echo "image=ghcr.io/${{ github.repository }}:pr-${PR_NUM}" >> $GITHUB_OUTPUT
+
+      - name: Remove preview container
+        env:
+          CONTAINER: ${{ steps.meta.outputs.container }}
+          IMAGE: ${{ steps.meta.outputs.image }}
+          SERVER: ${{ inputs.server_user }}@${{ inputs.server_host }}
+        run: |
+          ssh -o StrictHostKeyChecking=no ${SERVER} bash -s <<CLEANUP_EOF
+            sudo docker rm -f ${CONTAINER} 2>/dev/null || true
+            sudo docker rmi ${IMAGE} 2>/dev/null || true
+            sudo docker image prune -f
+          CLEANUP_EOF
