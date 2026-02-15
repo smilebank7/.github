@@ -11,6 +11,10 @@ on:
         description: "Path to Dockerfile"
         type: string
         default: "./Dockerfile"
+      platform:
+        description: "Docker build platform"
+        type: string
+        default: "linux/arm64"
       server_host:
         description: "Deploy server host"
         type: string
@@ -26,7 +30,11 @@ on:
       runner:
         description: "GitHub Actions runner label (JSON array)"
         type: string
-        default: '["self-hosted", "linux", "arm64"]'
+        default: '["ubuntu-latest"]'
+    secrets:
+      DEPLOY_SSH_KEY:
+        description: "SSH private key for deploy server"
+        required: true
 
 jobs:
   deploy:
@@ -55,6 +63,24 @@ jobs:
           echo "host=${HOST}" >> $GITHUB_OUTPUT
           echo "image=${IMAGE}" >> $GITHUB_OUTPUT
 
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ inputs.server_host }} >> ~/.ssh/known_hosts 2>/dev/null
+          echo "Host deploy-server
+            HostName ${{ inputs.server_host }}
+            User ${{ inputs.server_user }}
+            IdentityFile ~/.ssh/deploy_key
+            StrictHostKeyChecking no" > ~/.ssh/config
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -68,7 +94,10 @@ jobs:
           context: .
           file: ${{ inputs.dockerfile }}
           push: true
+          platforms: ${{ inputs.platform }}
           tags: ${{ steps.meta.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Deploy preview container
         env:
@@ -76,10 +105,9 @@ jobs:
           HOST: ${{ steps.meta.outputs.host }}
           IMAGE: ${{ steps.meta.outputs.image }}
           PORT: ${{ inputs.port }}
-          SERVER: ${{ inputs.server_user }}@${{ inputs.server_host }}
           DOMAIN: ${{ inputs.preview_domain }}
         run: |
-          ssh -o StrictHostKeyChecking=no ${SERVER} bash -s <<DEPLOY_EOF
+          ssh deploy-server bash -s <<DEPLOY_EOF
             # Login to GHCR
             echo '${{ secrets.GITHUB_TOKEN }}' | sudo docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
@@ -153,10 +181,20 @@ jobs:
   cleanup:
     if: github.event.action == 'closed'
     runs-on: ${{ fromJSON(inputs.runner) }}
-    permissions:
-      packages: write
 
     steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ inputs.server_host }} >> ~/.ssh/known_hosts 2>/dev/null
+          echo "Host deploy-server
+            HostName ${{ inputs.server_host }}
+            User ${{ inputs.server_user }}
+            IdentityFile ~/.ssh/deploy_key
+            StrictHostKeyChecking no" > ~/.ssh/config
+
       - name: Set preview metadata
         id: meta
         run: |
@@ -169,9 +207,8 @@ jobs:
         env:
           CONTAINER: ${{ steps.meta.outputs.container }}
           IMAGE: ${{ steps.meta.outputs.image }}
-          SERVER: ${{ inputs.server_user }}@${{ inputs.server_host }}
         run: |
-          ssh -o StrictHostKeyChecking=no ${SERVER} bash -s <<CLEANUP_EOF
+          ssh deploy-server bash -s <<CLEANUP_EOF
             sudo docker rm -f ${CONTAINER} 2>/dev/null || true
             sudo docker rmi ${IMAGE} 2>/dev/null || true
             sudo docker image prune -f
